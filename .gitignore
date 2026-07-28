@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local agent metadata
+.learnings/
+
+# Datasets, checkpoints, and generated outputs
+database/
+ISPRS/
+checkpoints/
+results/
+outputs/
+logs/
+*.pth
+*.pt
+*.ckpt
+
+# Local secrets
+.env
+.env.*

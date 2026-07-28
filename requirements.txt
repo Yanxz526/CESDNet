@@ -1,0 +1,19 @@
+# CESDNet requires Python 3.11 because the bundled DINOv3 source targets 3.11.
+# Install a CUDA-enabled build of this PyTorch pair when training on NVIDIA GPUs.
+torch==2.7.1
+torchvision==0.22.1
+
+# Data loading, image processing, and metrics.
+numpy
+Pillow
+opencv-python
+scikit-image
+scipy
+
+# DFormer uses only MMCV's Python CNN helpers; CUDA operators are not required.
+mmcv-lite==2.1.0
+mmengine
+
+# Teacher backbone adaptation and the local timm fallback.
+peft
+timm>=1.0.20
