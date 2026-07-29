@@ -1,10 +1,6 @@
 <div align="center">
 
-<h1>CESDNet</h1>
-
-<p><strong>Disentangle-Then-Distill: Complementary Expert-Guided Structured Knowledge Distillation<br>for Remote Sensing Semantic Segmentation</strong></p>
-
-<p><em>Multimodal training, optical-only deployment.</em></p>
+<h1>Disentangle-Then-Distill: Complementary Expert-Guided Structured Distillation<br>for Remote Sensing Semantic Segmentation</h1>
 
 <p>
   <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" alt="Python 3.11"/>
