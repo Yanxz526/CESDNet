@@ -12,7 +12,7 @@ PALETTE: Dict[int, Tuple[int, int, int]] = {
     3: (0, 255, 0),
     4: (255, 255, 0),
     5: (255, 0, 0),
-    6: (0, 0, 0),
+    255: (0, 0, 0),
 }
 INVERT_PALETTE = {value: key for key, value in PALETTE.items()}
 
@@ -25,7 +25,7 @@ def label_to_color(label: np.ndarray) -> np.ndarray:
 
 
 def color_to_label(color: np.ndarray) -> np.ndarray:
-    label = np.zeros(color.shape[:2], dtype=np.uint8)
+    label = np.full(color.shape[:2], 255, dtype=np.uint8)
     for rgb, cls_id in INVERT_PALETTE.items():
         label[np.all(color == np.array(rgb, dtype=np.uint8).reshape(1, 1, 3), axis=2)] = cls_id
     return label

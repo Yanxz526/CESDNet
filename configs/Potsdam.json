@@ -1,0 +1,72 @@
+{
+  "dataset": "Potsdam",
+  "n_classes": 6,
+  "crop_size": [
+    256,
+    256
+  ],
+  "p": 0.5,
+  "split_manifests": {
+    "train": "train.txt",
+    "val": "val.txt",
+    "test": "test.txt"
+  },
+  "tile_ids": {
+    "train": [
+      "2_10",
+      "3_10",
+      "3_11",
+      "3_12",
+      "4_11",
+      "4_12",
+      "5_10",
+      "5_12",
+      "6_8",
+      "6_9",
+      "6_10",
+      "6_11",
+      "6_12",
+      "7_7",
+      "7_9",
+      "7_11",
+      "7_12"
+    ],
+    "val": [
+      "2_11",
+      "2_12",
+      "4_10",
+      "5_11",
+      "6_7",
+      "7_8",
+      "7_10"
+    ],
+    "test": [
+      "2_13",
+      "2_14",
+      "3_13",
+      "3_14",
+      "4_13",
+      "4_14",
+      "4_15",
+      "5_13",
+      "5_14",
+      "5_15",
+      "6_13",
+      "6_14",
+      "6_15",
+      "7_13"
+    ]
+  },
+  "optical_channels": [
+    "NIR",
+    "R",
+    "G"
+  ],
+  "optical_scale": 255,
+  "ndsm_encoding": "uint8_normalized",
+  "ndsm_scale": 255,
+  "ignore_index": 255,
+  "patch_size": 256,
+  "stride": 256,
+  "stride_note": "Manuscript does not specify stride; 256 is the explicit release preparation setting."
+}

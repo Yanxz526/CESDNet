@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 if __package__ is None or __package__ == "":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import torch
@@ -25,7 +25,10 @@ from CESDNet.utils.checkpoint import load_state_dict_flexible, save_checkpoint
 from CESDNet.utils.data import build_dataloaders, ensure_dir, seed_everything
 from CESDNet.utils.metrics import compute_metrics, metric_line, update_confusion
 from log import get_logger
-from toolbox.loss.loss import MscCrossEntropyLoss
+from CESDNet.utils.runtime import require_checkpoint, resolve_device
+from CESDNet.utils.runtime import (add_runtime_args, apply_runtime_args, limited_batches,
+    checked_loss, snapshot_runtime, restore_training, data_signature)
+from CESDNet.utils.runtime import SegmentationLoss as MscCrossEntropyLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", default="")
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--amp", action="store_true")
+    add_runtime_args(parser, training=True)
     return parser.parse_args()
 
 
@@ -67,7 +71,7 @@ def evaluate_teacher(model, val_loader, criterion, config: CESDNetConfig, device
     val_loss = 0.0
     confusion = np.zeros((config.num_classes, config.num_classes), dtype=np.int64)
     with torch.no_grad():
-        for sample in val_loader:
+        for sample in limited_batches(val_loader, config.max_val_batches):
             x = sample["image"].to(device, non_blocking=True).float()
             z = sample["dsm"].to(device, non_blocking=True).float()
             y = sample["label"].to(device, non_blocking=True).long()
@@ -84,15 +88,21 @@ def evaluate_teacher(model, val_loader, criterion, config: CESDNetConfig, device
                 ignore_labels=config.eval_ignore_labels,
             )
     metrics = compute_metrics(confusion, config.eval_class_indices)
-    return val_loss / max(len(val_loader), 1), metrics
+    return val_loss / max(min(len(val_loader), config.max_val_batches or len(val_loader)), 1), metrics
 
 
 def main() -> None:
     args = parse_args()
-    config = make_config(args)
-    seed_everything(config.seed)
+    config = apply_runtime_args(make_config(args), args)
+    if args.resume:
+        require_checkpoint(args.resume, "Provide --resume with a complete teacher training checkpoint.")
+    else:
+        require_checkpoint(config.teacher_backbone,
+                           "Provide --teacher-backbone with DINOv3 ViT-L/16 LVD-1689M weights, or --resume with a complete teacher training checkpoint.")
+    config.amp = args.amp
+    seed_everything(config.seed, deterministic=getattr(config, "deterministic", False))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args)
     train_loader, val_loader = build_dataloaders(config, batch_size=config.teacher_batch_size)
     use_gmr_prior = infer_teacher_use_gmr_prior(args.resume) if args.resume else True
     texture_mode = infer_teacher_texture_mode(args.resume) if args.resume else "profile_b"
@@ -102,13 +112,9 @@ def main() -> None:
         use_gmr_prior=use_gmr_prior,
         texture_mode=texture_mode,
         head_profile=head_profile,
+        checkpoint_path=args.resume or None,
     ).to(device)
 
-    if args.resume:
-        msg = load_state_dict_flexible(model, args.resume, strict=False)
-        print(
-            f"Loaded resume checkpoint: missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}"
-        )
 
     criterion = MscCrossEntropyLoss(ignore_index=config.ignore_index).to(device)
     optimizer = optim.AdamW(
@@ -128,14 +134,17 @@ def main() -> None:
     )
 
     metrics_csv = output_dir / "metrics.csv"
-    with metrics_csv.open("w", newline="", encoding="utf-8") as fp:
-        csv.writer(fp).writerow(["epoch", "train_loss", "val_loss", "macc", "miou", "oa", "kappa"])
+    if not args.resume or not metrics_csv.is_file():
+        with metrics_csv.open("w", newline="", encoding="utf-8") as fp:
+            csv.writer(fp).writerow(["epoch", "train_loss", "val_loss", "macc", "miou", "oa", "kappa"])
 
-    best_miou = 0.0
-    for epoch in range(config.epochs):
+    start_epoch, best_miou = 0, 0.0
+    if args.resume:
+        start_epoch, best_miou = restore_training(args.resume, optimizer, scheduler, scaler, train_loader, config)
+    for epoch in range(start_epoch, config.epochs):
         model.train()
         train_loss = 0.0
-        for step, sample in enumerate(train_loader, start=1):
+        for step, sample in enumerate(limited_batches(train_loader, config.max_train_batches), start=1):
             x = sample["image"].to(device, non_blocking=True).float()
             z = sample["dsm"].to(device, non_blocking=True).float()
             y = sample["label"].to(device, non_blocking=True).long()
@@ -147,7 +156,7 @@ def main() -> None:
                 L_ortho = getattr(model, "ortho_loss", O_t.new_zeros(())) * config.teacher_ortho_weight
                 L_teacher = L_seg + L_ortho
 
-            scaler.scale(L_teacher).backward()
+            scaler.scale(checked_loss(L_teacher)).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             scaler.step(optimizer)
@@ -162,7 +171,7 @@ def main() -> None:
                 )
 
         val_loss, metrics = evaluate_teacher(model, val_loader, criterion, config, device)
-        train_loss /= max(len(train_loader), 1)
+        train_loss /= max(min(len(train_loader), config.max_train_batches or len(train_loader)), 1)
         scheduler.step()
 
         logger.info(
@@ -188,7 +197,11 @@ def main() -> None:
             "scheduler_state_dict": scheduler.state_dict(),
             "best_miou": best_miou,
             "config": vars(config),
+            **snapshot_runtime(scaler, train_loader),
+            "data_signature": data_signature(config),
         }
+        miou_pct = float(metrics["miou"]) * 100
+        payload["best_miou"] = max(best_miou, miou_pct)
         save_checkpoint(output_dir / "CESDNet-T-last.pth", payload)
         miou_pct = float(metrics["miou"]) * 100
         if miou_pct >= best_miou:
@@ -196,6 +209,10 @@ def main() -> None:
             payload["best_miou"] = best_miou
             save_checkpoint(output_dir / f"CESDNet-T-{config.dataset}-best.pth", payload)
             print(f"Saved best CESDNet-T mIoU={best_miou:.3f}")
+
+        if config.stop_after_epoch and epoch + 1 >= config.stop_after_epoch:
+            print(f'Diagnostic stop after epoch {epoch + 1}; checkpoint saved.')
+            break
 
 
 if __name__ == "__main__":

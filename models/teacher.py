@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import io
-import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -15,73 +11,12 @@ from peft import LoraConfig, get_peft_model
 from CESDNet.config import CESDNetConfig, REPO_ROOT
 
 
-_MODEL_DIRS = (
-    REPO_ROOT / "toolbox" / "models" / "Ourmodel",
-    REPO_ROOT / "toolbox" / "models" / "BEFORE" / "Ourmodel",
+from toolbox.models.Ourmodel.GeoMoE import GeoMoE, normalize_map, orthogonal_loss
+from toolbox.models.Ourmodel.TPE import (
+    ConvDWT, ConvIDWT, DropPath, GRNwithNHWC, LearnableGaussianFilterBank,
+    LowFrequencyRefinement as SWBlock, NCHWtoNHWC, NHWCtoNCHW,
+    SEBlock, SpatialAttention, TPE, get_texture_bn,
 )
-for model_dir in _MODEL_DIRS:
-    if model_dir.exists() and str(model_dir) not in sys.path:
-        sys.path.insert(0, str(model_dir))
-try:
-    import toolbox.models as _toolbox_models
-
-    before_models = REPO_ROOT / "toolbox" / "models" / "BEFORE"
-    if before_models.exists() and str(before_models) not in _toolbox_models.__path__:
-        _toolbox_models.__path__.append(str(before_models))
-except Exception:
-    pass
-
-try:
-    from ARConv import ARConv
-except ImportError as exc:
-    raise ImportError(f"Missing ARConv.py under {_MODEL_DIRS}") from exc
-
-
-def orthogonal_loss(F_tex: torch.Tensor, F_geo: torch.Tensor) -> torch.Tensor:
-    b, c, _, _ = F_tex.shape
-    tex = F.normalize(F_tex.view(b, c, -1), p=2, dim=1)
-    geo = F.normalize(F_geo.view(b, c, -1), p=2, dim=1)
-    return torch.mean(torch.abs(torch.sum(tex * geo, dim=1)))
-
-
-def normalize_map(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    x_min = x.amin(dim=(2, 3), keepdim=True)
-    x_max = x.amax(dim=(2, 3), keepdim=True)
-    return (x - x_min) / (x_max - x_min + eps)
-
-
-def _load_gmr_conv2d():
-    try:
-        from GMR_Conv.gmr_conv import GMR_Conv2d
-
-        return GMR_Conv2d
-    except ImportError:
-        for candidate in (
-            _MODEL_DIRS[0] / "GMR-Conv" / "src",
-            _MODEL_DIRS[0] / "src",
-            _MODEL_DIRS[0],
-            _MODEL_DIRS[1] / "GMR_Conv_main" / "src",
-            _MODEL_DIRS[1] / "GMR-Conv" / "src",
-            _MODEL_DIRS[1] / "src",
-            _MODEL_DIRS[1],
-        ):
-            if candidate.exists() and str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-        try:
-            from GMR_Conv.gmr_conv import GMR_Conv2d
-
-            return GMR_Conv2d
-        except ImportError as exc:
-            raise ImportError("Missing GMR_Conv.gmr_conv.GMR_Conv2d in the local repository") from exc
-
-
-def _load_profile_texture_block():
-    try:
-        from SW_v2_unirep import Block
-
-        return Block
-    except ImportError as exc:
-        raise ImportError(f"Missing SW_v2_unirep.py under {_MODEL_DIRS}") from exc
 
 
 def _unwrap_checkpoint_state(checkpoint: Any) -> Mapping[str, torch.Tensor]:
@@ -99,11 +34,11 @@ def infer_teacher_use_gmr_prior(checkpoint_path: str | Path | None, default: boo
         return default
     path = Path(checkpoint_path)
     if not path.is_file():
-        return default
-    checkpoint = torch.load(str(path), map_location="cpu")
+        raise FileNotFoundError(f"Teacher checkpoint not found: {path}")
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
     state_dict = _unwrap_checkpoint_state(checkpoint)
     if not isinstance(state_dict, Mapping):
-        return default
+        raise ValueError(f"Teacher checkpoint must contain a state dictionary: {path}")
     for key, value in state_dict.items():
         if key.endswith("geo_expert.m_conv.0.weight") and hasattr(value, "ndim"):
             if value.ndim == 3:
@@ -118,11 +53,11 @@ def infer_teacher_texture_mode(checkpoint_path: str | Path | None, default: str 
         return default
     path = Path(checkpoint_path)
     if not path.is_file():
-        return default
-    checkpoint = torch.load(str(path), map_location="cpu")
+        raise FileNotFoundError(f"Teacher checkpoint not found: {path}")
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
     state_dict = _unwrap_checkpoint_state(checkpoint)
     if not isinstance(state_dict, Mapping):
-        return default
+        raise ValueError(f"Teacher checkpoint must contain a state dictionary: {path}")
     for key in state_dict:
         if "tex_expert.texture_backbone" in key:
             return "profile_b"
@@ -137,423 +72,16 @@ def infer_teacher_head_profile(checkpoint_path: str | Path | None, default: str 
         return default
     path = Path(checkpoint_path)
     if not path.is_file():
-        return default
-    checkpoint = torch.load(str(path), map_location="cpu")
+        raise FileNotFoundError(f"Teacher checkpoint not found: {path}")
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
     state_dict = _unwrap_checkpoint_state(checkpoint)
     if not isinstance(state_dict, Mapping):
-        return default
+        raise ValueError(f"Teacher checkpoint must contain a state dictionary: {path}")
     if any(key.startswith("decoder.out_head.0.fc.") for key in state_dict):
         return "profile_a"
     if any(key.startswith("decoder.out_head.0.fc1.") for key in state_dict):
         return "profile_b"
     return default
-
-
-class ConvDWT(nn.Module):
-    def __init__(self, wave: str = "haar", mode: str = "zero") -> None:
-        super().__init__()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != torch.float32:
-            x = x.float()
-        x01 = x[:, :, 0::2, :] / 2.0
-        x02 = x[:, :, 1::2, :] / 2.0
-        x1 = x01[:, :, :, 0::2]
-        x2 = x02[:, :, :, 0::2]
-        x3 = x01[:, :, :, 1::2]
-        x4 = x02[:, :, :, 1::2]
-        Y_l = x1 + x2 + x3 + x4
-        H_l = -x1 - x2 + x3 + x4
-        L_h = -x1 + x2 - x3 + x4
-        H_h = x1 - x2 - x3 + x4
-        return torch.cat((Y_l, torch.cat([H_l, L_h, H_h], dim=1)), dim=1)
-
-
-class ConvIDWT(nn.Module):
-    def __init__(self, wave: str = "haar", mode: str = "zero") -> None:
-        super().__init__()
-
-    def forward(self, low_freqs: torch.Tensor, high_freqs: torch.Tensor) -> torch.Tensor:
-        H_l, L_h, H_h = torch.chunk(high_freqs, 3, dim=1)
-        x1 = low_freqs - H_l - L_h + H_h
-        x2 = low_freqs - H_l + L_h - H_h
-        x3 = low_freqs + H_l - L_h - H_h
-        x4 = low_freqs + H_l + L_h + H_h
-        b, c, h, w = low_freqs.shape
-        out = torch.zeros(b, c, h * 2, w * 2, device=low_freqs.device, dtype=low_freqs.dtype)
-        out[:, :, 0::2, 0::2] = x1
-        out[:, :, 1::2, 0::2] = x2
-        out[:, :, 0::2, 1::2] = x3
-        out[:, :, 1::2, 1::2] = x4
-        return out
-
-
-class GRNwithNHWC(nn.Module):
-    def __init__(self, dim: int, use_bias: bool = True) -> None:
-        super().__init__()
-        self.use_bias = use_bias
-        self.gamma = nn.Parameter(torch.zeros(1, 1, 1, dim))
-        if use_bias:
-            self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
-        nx = gx / (gx.mean(dim=-1, keepdim=True) + 1e-6)
-        out = (self.gamma * nx + 1) * x
-        if self.use_bias:
-            out = out + self.beta
-        return out
-
-
-class NCHWtoNHWC(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.permute(0, 2, 3, 1)
-
-
-class NHWCtoNCHW(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x.permute(0, 3, 1, 2)
-
-
-class SEBlock(nn.Module):
-    def __init__(self, input_channels: int, internal_neurons: int) -> None:
-        super().__init__()
-        self.down = nn.Conv2d(input_channels, internal_neurons, kernel_size=1, stride=1, bias=True)
-        self.up = nn.Conv2d(internal_neurons, input_channels, kernel_size=1, stride=1, bias=True)
-        self.input_channels = input_channels
-        self.nonlinear = nn.ReLU(inplace=True)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        x = F.adaptive_avg_pool2d(inputs, output_size=(1, 1))
-        x = self.down(x)
-        x = self.nonlinear(x)
-        x = self.up(x)
-        x = torch.sigmoid(x)
-        return inputs * x.view(-1, self.input_channels, 1, 1)
-
-
-class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0) -> None:
-        super().__init__()
-        self.drop_prob = float(drop_prob)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep_prob = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        return x.div(keep_prob) * random_tensor
-
-
-def get_texture_bn(channels: int) -> nn.Module:
-    return nn.SyncBatchNorm(channels)
-
-
-class SWBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        drop_path: float = 0.0,
-        layer_scale_init_value: float = 1e-6,
-        kernel_size: tuple[int, int] = (7, 7),
-        ghost_ratio: float = 0.23,
-        N_path: int = 2,
-        N_rep: int = 4,
-        bn: bool = True,
-        deploy: bool = False,
-        use_lk_impl: bool = False,
-    ) -> None:
-        super().__init__()
-        del ghost_ratio, N_path, N_rep, bn
-        if use_lk_impl:
-            raise ValueError("CESDNet teacher only supports SWBlock(use_lk_impl=False).")
-
-        self.large_kernel = nn.Conv2d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=kernel_size[1],
-            stride=1,
-            padding=kernel_size[1] // 2,
-            groups=dim,
-            bias=False,
-        )
-        self.norm = get_texture_bn(dim)
-        self.se = SEBlock(dim, dim // 4)
-        self.pwconv1 = nn.Sequential(NCHWtoNHWC(), nn.Linear(dim, 4 * dim))
-        self.act = nn.Sequential(nn.GELU(), GRNwithNHWC(4 * dim, use_bias=not deploy))
-        self.pwconv2 = nn.Sequential(nn.Linear(4 * dim, dim, bias=False), NHWCtoNCHW(), get_texture_bn(dim))
-        self.gamma = (
-            nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
-            if layer_scale_init_value > 0
-            else None
-        )
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.large_kernel(x)
-        x = self.se(self.norm(x))
-        x = self.pwconv2(self.act(self.pwconv1(x)))
-        if self.gamma is not None:
-            x = self.gamma.view(1, -1, 1, 1) * x
-        return residual + self.drop_path(x)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size: int = 7, bn_before_sigmoid: bool = False) -> None:
-        super().__init__()
-        padding = 3 if kernel_size == 7 else 1
-        self.bn_before_sigmoid = bn_before_sigmoid
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        if bn_before_sigmoid:
-            self.bn = nn.BatchNorm2d(1)
-            self.bn.bias.data.fill_(0)
-            self.bn.bias.requires_grad = False
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = self.conv1(torch.cat([avg_out, max_out], dim=1))
-        if self.bn_before_sigmoid:
-            x = self.bn(x)
-        return self.sigmoid(x)
-
-
-class LearnableGaussianFilterBank(nn.Module):
-    def __init__(self, kernel_size: int, num_filters: int, num_channels: int) -> None:
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.num_filters = num_filters
-        self.C = num_channels
-        self.padding = kernel_size // 2
-        self.sigmas = nn.ParameterList([nn.Parameter(torch.tensor([1.0])) for _ in range(num_filters)])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weights = [
-            self._gaussian_kernel(self.kernel_size, sigma).repeat(self.C, 1, 1, 1)
-            for sigma in self.sigmas
-        ]
-        filtered_outputs = [
-            F.conv2d(
-                F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode="replicate"),
-                weight.to(device=x.device, dtype=x.dtype),
-                groups=self.C,
-            )
-            for weight in weights
-        ]
-        return torch.cat(filtered_outputs, dim=1)
-
-    @staticmethod
-    def _gaussian_kernel(kernel_size: int, sigma: torch.Tensor) -> torch.Tensor:
-        device, dtype = sigma.device, sigma.dtype
-        center = kernel_size // 2
-        ar = torch.arange(kernel_size, device=device, dtype=dtype) - center
-        yy = ar.view(-1, 1).expand(kernel_size, kernel_size)
-        xx = ar.view(1, -1).expand(kernel_size, kernel_size)
-        kernel = torch.exp(-(yy**2 + xx**2) / (2 * sigma**2 + 1e-12))
-        kernel = kernel.view(1, 1, kernel_size, kernel_size)
-        return kernel / (kernel.sum() + 1e-12)
-
-
-class LFP_TextureExpert(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        wave: str = "haar",
-        mode: str = "symmetric",
-        with_gauss: bool = True,
-        gauss_gate: float = 0.5,
-    ) -> None:
-        super().__init__()
-        self.dwt = ConvDWT(wave=wave, mode=mode)
-        self.idwt = ConvIDWT(wave=wave, mode=mode)
-        self.with_gauss = with_gauss
-        self.gauss_gate = gauss_gate
-        self.texture_backbone = SWBlock(dim=in_channels, use_lk_impl=False)
-        self.attention = SpatialAttention()
-        if self.with_gauss:
-            self.gaussian_filter = LearnableGaussianFilterBank(
-                kernel_size=3,
-                num_filters=1,
-                num_channels=3 * in_channels,
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, c, _, _ = x.shape
-        dwt_out = self.dwt(x)
-        low_freq = dwt_out[:, :c]
-        high_freq = dwt_out[:, c:]
-
-        clean_low = self.texture_backbone(low_freq)
-        if isinstance(clean_low, tuple):
-            clean_low = clean_low[0]
-
-        high_freq = high_freq * self.attention(clean_low)
-        if self.with_gauss:
-            blurred = self.gaussian_filter(high_freq)
-            mask = (high_freq.abs() < self.gauss_gate).float()
-            high_freq = high_freq * (1 - mask) + blurred * mask
-        return self.idwt(clean_low, high_freq)
-
-
-class OrthogonalDualExpertAdapter(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        reduction_dim: int = 256,
-        use_gmr_prior: bool = True,
-        texture_mode: str = "profile_b",
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.reduction_dim = reduction_dim
-        self.use_gmr_prior = use_gmr_prior
-        self.texture_mode = texture_mode
-
-        self.down_proj = nn.Sequential(
-            nn.Conv2d(dim, reduction_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(reduction_dim),
-            nn.GELU(),
-        )
-
-        self.register_buffer(
-            "sobel_x",
-            torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3),
-        )
-        self.register_buffer(
-            "sobel_y",
-            torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3),
-        )
-        self.spatial_router = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 2, kernel_size=1),
-        )
-
-        if self.texture_mode == "profile_a":
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.tex_expert = _load_profile_texture_block()(dim=reduction_dim)
-        elif self.texture_mode == "profile_b":
-            self.tex_expert = LFP_TextureExpert(in_channels=reduction_dim)
-        else:
-            raise ValueError(f"Unsupported teacher profile: {self.texture_mode}")
-        self.geo_expert = ARConv(inc=reduction_dim, outc=reduction_dim)
-        if self.use_gmr_prior:
-            self._inject_gmr_prior(self.geo_expert, reduction_dim)
-
-        self.up_proj = nn.Conv2d(reduction_dim, dim, kernel_size=1)
-        self.norm = nn.LayerNorm(dim)
-        if self.texture_mode == "profile_b":
-            self.tex_response = nn.Conv2d(reduction_dim, 1, kernel_size=1)
-            self.geo_response = nn.Conv2d(reduction_dim, 1, kernel_size=1)
-
-    @staticmethod
-    def _inject_gmr_prior(arconv_module: nn.Module, dim: int) -> None:
-        GMR_Conv2d = _load_gmr_conv2d()
-        arconv_module.m_conv[0] = GMR_Conv2d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=3,
-            padding=1,
-            stride=1,
-            dw_fwd=False,
-        )
-        arconv_module.b_conv[0] = GMR_Conv2d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=3,
-            padding=1,
-            stride=1,
-            dw_fwd=False,
-        )
-        arconv_module.hook_handles.append(arconv_module.m_conv[0].register_full_backward_hook(arconv_module._set_lr))
-        arconv_module.hook_handles.append(arconv_module.b_conv[0].register_full_backward_hook(arconv_module._set_lr))
-
-    def forward(
-        self,
-        F_rgb_i: torch.Tensor,
-        G_z: torch.Tensor,
-        epoch: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        b, c, h, w = F_rgb_i.shape
-        F_down_i = self.down_proj(F_rgb_i)
-
-        geo_map = G_z.mean(dim=1, keepdim=True)
-        grad_x = F.conv2d(geo_map, self.sobel_x, padding=1)
-        grad_y = F.conv2d(geo_map, self.sobel_y, padding=1)
-        edge_intensity = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
-
-        route_logits = self.spatial_router(edge_intensity)
-        route_weights = F.softmax(route_logits, dim=1)
-        w_tex = route_weights[:, 0:1]
-        w_geo = route_weights[:, 1:2]
-
-        if self.texture_mode == "profile_a":
-            F_tex_i = self.tex_expert(F_down_i.float()).to(F_down_i.dtype)
-        else:
-            F_tex_i = self.tex_expert(F_down_i)
-        if isinstance(F_tex_i, tuple):
-            F_tex_i = F_tex_i[0]
-
-        F_geo_i = self.geo_expert(F_down_i, epoch=epoch, hw_range=[F_down_i.shape[2], F_down_i.shape[3]])
-        if isinstance(F_geo_i, tuple):
-            F_geo_i = F_geo_i[0]
-
-        F_fused_i = F_tex_i * w_tex + F_geo_i * w_geo
-
-        if self.texture_mode == "profile_b":
-            r_tex_i = self.tex_response(F_tex_i)
-            r_geo_i = self.geo_response(F_geo_i)
-        else:
-            r_tex_i = F_tex_i.mean(dim=1, keepdim=True)
-            r_geo_i = F_geo_i.mean(dim=1, keepdim=True)
-        p_tex_i = torch.sigmoid(r_tex_i)
-        p_geo_i = torch.sigmoid(r_geo_i)
-
-        A_i = torch.clamp(torch.exp(-4.0 * torch.abs(p_tex_i - p_geo_i)), 0.0, 1.0)
-        C_i = torch.clamp(1.0 - A_i, 0.0, 1.0)
-
-        S_tex_i = normalize_map(torch.mean(torch.abs(F_tex_i), dim=1, keepdim=True))
-        S_geo_i = normalize_map(torch.mean(torch.abs(F_geo_i), dim=1, keepdim=True))
-
-        K_sh_i = 0.5 * (F_tex_i + F_geo_i) * A_i
-        K_tex_i = F_tex_i * torch.clamp(C_i * S_tex_i, 0.0, 1.0)
-        K_geo_i = F_geo_i * torch.clamp(C_i * S_geo_i, 0.0, 1.0)
-        r_sh_i = 0.5 * (r_tex_i + r_geo_i)
-
-        router_mean = route_weights.mean(dim=(0, 2, 3))
-        router_balance_loss = torch.sum((router_mean - 0.5) ** 2)
-        kd_dict = {
-            "shared": K_sh_i,
-            "tex_private": K_tex_i,
-            "geo_private": K_geo_i,
-            "tex_feature": F_tex_i,
-            "geo_feature": F_geo_i,
-            "tex_response": r_tex_i,
-            "geo_response": r_geo_i,
-            "response": r_sh_i,
-            "agreement": A_i,
-            "complementarity": C_i,
-            "shared_mask": A_i.detach(),
-            "tex_private_mask": torch.clamp(C_i * S_tex_i, 0.0, 1.0).detach(),
-            "geo_private_mask": torch.clamp(C_i * S_geo_i, 0.0, 1.0).detach(),
-            "router_tex": w_tex,
-            "router_geo": w_geo,
-            "tex_strength": S_tex_i,
-            "geo_strength": S_geo_i,
-            "router_balance_loss": router_balance_loss,
-        }
-
-        out = self.up_proj(F_fused_i)
-        out_flat = out.flatten(2).transpose(1, 2)
-        residual_flat = F_rgb_i.flatten(2).transpose(1, 2)
-        out = self.norm(out_flat + residual_flat)
-        out = out.transpose(1, 2).view(b, c, h, w)
-        return out, F_tex_i, F_geo_i, kd_dict
 
 
 class GeometricPriorEncoder(nn.Module):
@@ -725,15 +253,23 @@ class ImprovedExpertNet(nn.Module):
         use_gmr_prior: bool = True,
         texture_mode: str = "profile_b",
         head_profile: str = "profile_b",
+        architecture_version: str = "paper_v1",
+        checkpoint_path: str | Path | None = None,
     ) -> None:
         super().__init__()
         if isinstance(repo_dir, tuple):
             repo_dir = repo_dir[0]
         if isinstance(weights_path, tuple):
             weights_path = weights_path[0]
+        if architecture_version not in ("paper_v1", "legacy_v0"):
+            raise ValueError(f"Unsupported architecture version: {architecture_version}")
+        if architecture_version == "paper_v1" and texture_mode != "profile_b":
+            raise ValueError("paper_v1 requires the wavelet TPE (texture_mode='profile_b').")
+        self.architecture_version = architecture_version
+        self._checkpoint_verified = checkpoint_path is None
         self.sar_in_chans = sar_in_chans
-        self.patch_size = 16 if "16" in model_name else 14
-        self.backbone = self._load_backbone(repo_dir, weights_path, model_name, lora_r)
+        self.patch_size = 16
+        self.backbone = self._load_backbone(repo_dir, weights_path, model_name, lora_r, checkpoint_path)
 
         if hasattr(self.backbone, "base_model") and hasattr(self.backbone.base_model, "model"):
             embed_dim = self.backbone.base_model.model.embed_dim
@@ -750,11 +286,12 @@ class ImprovedExpertNet(nn.Module):
         self.extract_indices = [5, 11, 17, 23]
         self.adapters = nn.ModuleList(
             [
-                OrthogonalDualExpertAdapter(
+                GeoMoE(
                     dim=embed_dim,
                     reduction_dim=256,
                     use_gmr_prior=use_gmr_prior,
                     texture_mode=texture_mode,
+                    architecture_version=architecture_version,
                 )
                 for _ in range(4)
             ]
@@ -772,45 +309,63 @@ class ImprovedExpertNet(nn.Module):
     def _load_backbone(
         self,
         repo_dir: str | Path,
-        weights_path: str | Path,
+        weights_path: str | Path | None,
         model_name: str,
         lora_r: int,
+        checkpoint_path: str | Path | None = None,
     ) -> nn.Module:
-        print(f"Loading Backbone from local repo: {repo_dir}")
+        if model_name != "dinov3_vitl16":
+            raise ValueError(f"CESDNet requires dinov3_vitl16, got {model_name!r}.")
+        repo_dir = Path(repo_dir)
+        if not (repo_dir / "hubconf.py").is_file():
+            raise FileNotFoundError(f"DINOv3 local source is incomplete: {repo_dir / 'hubconf.py'}")
+        if checkpoint_path is not None and not Path(checkpoint_path).is_file():
+            raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")
+        pretrained_path = Path(weights_path) if weights_path else None
+        if checkpoint_path is None and (pretrained_path is None or not pretrained_path.is_file()):
+            raise FileNotFoundError(
+                f"DINOv3 pretrained weights are required for teacher training: {weights_path!r}. "
+                "Pass --teacher-backbone, or provide a complete teacher checkpoint for evaluation."
+            )
         try:
             model = torch.hub.load(str(repo_dir), model_name, source="local", pretrained=False)
         except Exception as exc:
-            print(f"Warning: failed to load local DINOv3 ({exc}). Using timm ViT fallback.")
-            import timm
-
-            model = timm.create_model("vit_large_patch16_256", pretrained=False)
-
-        if os.path.exists(weights_path):
+            raise RuntimeError(f"Cannot construct required DINOv3 ViT-L/16 from {repo_dir}") from exc
+        if (type(model).__name__ != "DinoVisionTransformer" or
+            getattr(model, "embed_dim", None) != 1024 or len(getattr(model, "blocks", [])) != 24 or
+            tuple(model.patch_embed.proj.kernel_size) != (16, 16) or
+            not callable(getattr(model, "get_intermediate_layers", None))):
+            raise TypeError("Backbone must be DINOv3 ViT-L/16 (24 blocks, 1024 channels, patch size 16).")
+        if checkpoint_path is None:
+            from CESDNet.utils.checkpoint import load_checkpoint_state, strip_module_prefix
+            state = strip_module_prefix(load_checkpoint_state(pretrained_path, preferred_keys=("teacher", "model")))
+            # strict=True rejects corrupt, incomplete and alternative-backbone states.
             try:
-                state_dict = torch.load(weights_path, map_location="cpu")
-                if "model" in state_dict:
-                    state_dict = state_dict["model"]
-                if "teacher" in state_dict:
-                    state_dict = state_dict["teacher"]
-                model.load_state_dict(state_dict, strict=False)
-            except Exception:
-                pass
-
-        embed_dim = getattr(model, "embed_dim", 1024)
-        model.patch_embed = DualPathPatchEmbed(
-            model.patch_embed,
-            embed_dim=embed_dim,
-            ndsm_in_chans=self.sar_in_chans,
-        )
+                model.load_state_dict(state, strict=True)
+            except Exception as exc:
+                raise RuntimeError(f"DINOv3 pretrained weights do not match ViT-L/16: {pretrained_path}") from exc
+            print(f"Strictly loaded DINOv3 ViT-L/16 pretrained weights: {pretrained_path}")
+        model.patch_embed = DualPathPatchEmbed(model.patch_embed, embed_dim=1024, ndsm_in_chans=self.sar_in_chans)
         peft_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_r * 2,
-            target_modules=["qkv", "proj", "fc1", "fc2"],
-            lora_dropout=0.1,
-            bias="lora_only",
-            modules_to_save=["patch_embed"],
+            r=lora_r, lora_alpha=lora_r * 2,
+            # Restrict LoRA to ViT blocks; suffix "proj" also matches the optical patch conv.
+            target_modules=r"blocks\.\d+\.(attn\.(qkv|proj)|mlp\.(fc1|fc2))",
+            lora_dropout=0.1, bias="lora_only", modules_to_save=["patch_embed"],
         )
-        return get_peft_model(model, peft_config)
+        model = get_peft_model(model, peft_config)
+        if self.architecture_version == "paper_v1":
+            # The original ViT, optical embedding and legacy LoRA matrices stay frozen.
+            # Only the additional nDSM embedding belongs to the trainable adaptation path.
+            for name, parameter in model.named_parameters():
+                parameter.requires_grad = ("patch_embed.modules_to_save.default.ndsm_embed." in name)
+        return model
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.architecture_version == "paper_v1":
+            # Frozen DINOv3 must not activate stochastic positional augmentation/dropout.
+            self.backbone.eval()
+        return self
 
     def forward(
         self,
@@ -821,6 +376,14 @@ class ImprovedExpertNet(nn.Module):
         return_kd: bool = False,
         epoch: int = 1,
     ):
+        if not self._checkpoint_verified:
+            raise RuntimeError("Complete teacher checkpoint has not been strictly loaded. Use build_cesdnet_t(..., checkpoint_path=...).")
+        if rgb.ndim != 4 or rgb.shape[1] != 3 or ndsm.ndim != 4 or ndsm.shape[1] != self.sar_in_chans:
+            raise ValueError("Teacher inputs must be aligned [B,3,H,W] IRRG and [B,1,H,W] nDSM.")
+        if rgb.shape[0] != ndsm.shape[0] or rgb.shape[-2:] != ndsm.shape[-2:]:
+            raise ValueError("IRRG and nDSM batch and spatial dimensions must match.")
+        if rgb.shape[-2] % 16 or rgb.shape[-1] % 16:
+            raise ValueError("Teacher spatial input dimensions must be divisible by 16.")
         device = rgb.device
         x_input = torch.cat([rgb, ndsm], dim=1)
         G_z = self.geo_encoder(ndsm)
@@ -839,8 +402,10 @@ class ImprovedExpertNet(nn.Module):
                 norm=True,
             )
         else:
-            features_seq = [vit_model.forward_features(x_input)] * 4
+            raise TypeError("DINOv3 must expose get_intermediate_layers; feature substitution is prohibited.")
 
+        if len(features_seq) != 4:
+            raise RuntimeError(f"DINOv3 returned {len(features_seq)} stages; expected four at blocks 6,12,18,24.")
         h_out = rgb.shape[-2] // self.patch_size
         w_out = rgb.shape[-1] // self.patch_size
         enhanced_feats = []
@@ -859,6 +424,8 @@ class ImprovedExpertNet(nn.Module):
             enhanced_feats.append(F_enh_i)
             kd_features.append(kd_dict)
 
+        if self.architecture_version == "paper_v1":
+            self.ortho_loss = self.ortho_loss / len(self.adapters)
         logits = self.decoder(enhanced_feats)
         if logits.shape[-2:] != rgb.shape[-2:]:
             logits = F.interpolate(logits, size=rgb.shape[-2:], mode="bilinear", align_corners=False)
@@ -885,8 +452,8 @@ class ImprovedExpertNet(nn.Module):
         return O_t
 
 
-TPE = LFP_TextureExpert
-GeoMoE = OrthogonalDualExpertAdapter
+LFP_TextureExpert = TPE
+OrthogonalDualExpertAdapter = GeoMoE
 
 
 def _stage_aliases(stage_kd: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -945,6 +512,8 @@ class CESDNetT(ImprovedExpertNet):
         use_gmr_prior: bool = True,
         texture_mode: str = "profile_b",
         head_profile: str = "profile_b",
+        architecture_version: str = "paper_v1",
+        checkpoint_path: str | Path | None = None,
     ) -> None:
         super().__init__(
             str(repo_dir),
@@ -956,6 +525,8 @@ class CESDNetT(ImprovedExpertNet):
             use_gmr_prior=use_gmr_prior,
             texture_mode=texture_mode,
             head_profile=head_profile,
+            architecture_version=architecture_version,
+            checkpoint_path=checkpoint_path,
         )
 
     def forward(
@@ -980,12 +551,39 @@ def build_cesdnet_t(
     use_gmr_prior: bool = True,
     texture_mode: str = "profile_b",
     head_profile: str = "profile_b",
+    checkpoint_path: str | Path | None = None,
 ) -> CESDNetT:
-    return CESDNetT(
+    architecture_version = getattr(config, "architecture_version", "paper_v1")
+    if checkpoint_path is not None:
+        from CESDNet.utils.checkpoint import read_checkpoint
+        payload = read_checkpoint(checkpoint_path)
+        recorded_config = payload.get("config", {}) if isinstance(payload, Mapping) else {}
+        recorded_version = recorded_config.get("architecture_version") if isinstance(recorded_config, Mapping) else None
+        if recorded_version is None:
+            if architecture_version != "legacy_v0":
+                raise ValueError(
+                    "Teacher checkpoint has no architecture metadata. Historical raw weights require "
+                    "explicit --architecture-version legacy_v0; they cannot certify paper_v1 behavior."
+                )
+        elif recorded_version != architecture_version:
+            raise ValueError(f"Teacher architecture mismatch: checkpoint={recorded_version}, requested={architecture_version}")
+        del payload
+    model = CESDNetT(
         repo_dir=config.teacher_repo,
         weights_path=config.teacher_backbone,
         num_classes=config.num_classes,
         use_gmr_prior=use_gmr_prior,
         texture_mode=texture_mode,
         head_profile=head_profile,
+        architecture_version=getattr(config, "architecture_version", "paper_v1"),
+        checkpoint_path=checkpoint_path,
     )
+    if checkpoint_path is not None:
+        from CESDNet.utils.checkpoint import load_state_dict_flexible
+        model.checkpoint_load_result = load_state_dict_flexible(
+            model, checkpoint_path,
+            preferred_keys=("teacher_state_dict", "state_dict", "model", "net"), strict=True,
+        )
+        model._checkpoint_verified = True
+        print(f"Strictly loaded complete CESDNet-T checkpoint: {checkpoint_path}")
+    return model

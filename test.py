@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Iterable, Iterator, Literal, Sequence
 
 if __package__ is None or __package__ == "":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import torch
@@ -15,6 +16,8 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from CESDNet.config import CESDNetConfig, REPO_ROOT
+from CESDNet.utils.runtime import require_checkpoint, resolve_device
+from CESDNet.utils.runtime import add_runtime_args, apply_runtime_args, limited_batches
 from CESDNet.models.student import CESDNetS, infer_student_architecture
 from CESDNet.utils.checkpoint import load_state_dict_flexible
 from CESDNet.utils.data import build_dataset, ensure_dir, seed_everything
@@ -28,8 +31,8 @@ from CESDNet.utils.metrics import (
 from CESDNet.utils.palette import color_to_label, label_to_color
 
 
-POTSDAM_TEST_IDS = ("2_11", "2_12", "4_10", "5_11", "6_7", "7_8", "7_10")
-VAIHINGEN_TEST_IDS = ("11", "15", "28", "30", "34")
+POTSDAM_TEST_IDS = ("2_13", "2_14", "3_13", "3_14", "4_13", "4_14", "4_15", "5_13", "5_14", "5_15", "6_13", "6_14", "6_15", "7_13")
+VAIHINGEN_TEST_IDS = ("2", "4", "6", "8", "10", "12", "14", "16", "20", "22", "24", "27", "29", "31", "33", "35", "38")
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,8 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-ids", nargs="*", default=None)
     parser.add_argument("--teacher-repo", default="")
     parser.add_argument("--teacher-backbone", default="")
-    parser.add_argument("--metric-mode", default="paper", choices=["paper", "global", "both"])
+    parser.add_argument("--metric-mode", default="global", choices=["paper", "global", "both", "legacy-per-tile"])
     parser.add_argument("--amp", action="store_true")
+    parser.add_argument('--max-batches', type=int, default=0, help='Positive values are partial diagnostics, not final scores.')
+    parser.add_argument('--split', choices=['val', 'test'], default='test')
+    parser.add_argument('--optical-product', choices=['IRRG', 'RGB'], default='IRRG', help='RGB is only for explicit legacy diagnostics.')
+    add_runtime_args(parser)
     return parser.parse_args()
 
 
@@ -81,7 +88,7 @@ def infer_model_name(checkpoint: str, config: CESDNetConfig) -> ModelName:
     if "kd" in checkpoint_text or "distill" in checkpoint_text or "cesdnet-kd" in checkpoint_text:
         return "kd"
 
-    checkpoint_obj = torch.load(str(checkpoint_path), map_location="cpu")
+    checkpoint_obj = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
     if isinstance(checkpoint_obj, dict):
         if "teacher_state_dict" in checkpoint_obj:
             return "teacher"
@@ -119,9 +126,9 @@ def load_student_model(
         model,
         checkpoint,
         preferred_keys=("student_state_dict", "state_dict", "model", "net"),
-        strict=False,
+        strict=True,
     )
-    print(f"Loaded {model_tag(model_name)}: missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}")
+    print(f"Loaded {model_tag(model_name)}: architecture={student_arch} missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}")
     model.eval()
     return model
 
@@ -147,15 +154,8 @@ def load_teacher_model(config: CESDNetConfig, checkpoint: str, device: torch.dev
         use_gmr_prior=use_gmr_prior,
         texture_mode=texture_mode,
         head_profile=head_profile,
+        checkpoint_path=checkpoint,
     ).to(device)
-    msg = load_state_dict_flexible(
-        model,
-        checkpoint,
-        preferred_keys=("teacher_state_dict", "state_dict", "model", "net"),
-        strict=False,
-    )
-    print(f"Loaded CESDNet-T: {checkpoint}")
-    print(f"missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}")
     model.eval()
     return model
 
@@ -179,7 +179,7 @@ def test_patches(
     args: argparse.Namespace,
     device: torch.device,
 ) -> None:
-    dataset = build_dataset(config, "test")
+    dataset = build_dataset(config, config.split, require_ndsm=args.model == "teacher")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -189,7 +189,7 @@ def test_patches(
         drop_last=False,
         persistent_workers=config.num_workers > 0,
     )
-    output_dir = None
+    output_dir = ensure_dir(Path(args.output_dir)) if args.output_dir else None
     if args.save_predictions:
         output_dir = ensure_dir(
             Path(args.output_dir)
@@ -201,7 +201,7 @@ def test_patches(
     confusion = np.zeros((config.num_classes, config.num_classes), dtype=np.int64)
 
     with torch.no_grad():
-        for sample in loader:
+        for sample in limited_batches(loader, args.max_batches):
             x = sample["image"].to(device, non_blocking=True).float()
             y = sample["label"].to(device, non_blocking=True).long()
             z = sample["dsm"].to(device, non_blocking=True).float() if args.model == "teacher" else None
@@ -228,10 +228,23 @@ def test_patches(
     print(metric_line(metrics))
     if output_dir is not None:
         np.save(output_dir / "confusion.npy", confusion)
+        report = {
+            'dataset': config.dataset, 'split': config.split, 'model': args.model,
+            'checkpoint': args.checkpoint, 'architecture_version': config.architecture_version,
+            'metric_protocol': 'global confusion', 'partial': bool(args.max_batches),
+            'evaluated_pixels': int(confusion.sum()),
+            'macc': float(metrics['macc']) * 100, 'miou': float(metrics['miou']) * 100,
+            'oa': float(metrics['oa']) * 100, 'kappa': float(metrics['kappa']) * 100,
+            'class_iou': np.asarray(metrics['iou']).tolist(),
+            'class_acc': np.asarray(metrics['acc']).tolist(), 'confusion': confusion.tolist(),
+        }
+        (output_dir / 'eval_metrics.json').write_text(json.dumps(report, indent=2))
 
 
 def sliding_window(shape: tuple[int, int], window_size: int, stride: int) -> Iterator[tuple[int, int, int, int]]:
     h, w = shape
+    if stride <= 0 or stride > window_size or window_size <= 0:
+        raise ValueError("Require 0 < stride <= window_size for complete coverage")
     if h < window_size or w < window_size:
         raise ValueError(f"Image {shape} is smaller than window_size={window_size}")
     tops = list(range(0, h - window_size + 1, stride))
@@ -256,26 +269,27 @@ def batched(iterable: Iterable[tuple[int, int, int, int]], batch_size: int):
         yield batch
 
 
-def isprs_paths(dataset: str, tile_id: str) -> tuple[Path, Path, Path, str]:
-    root = REPO_ROOT / "ISPRS"
+def isprs_paths(dataset: str, tile_id: str, isprs_root=None, optical_product="IRRG") -> tuple[Path, Path, Path, str]:
+    root = Path(isprs_root) if isprs_root else REPO_ROOT / "ISPRS"
     if dataset == "Potsdam":
-        image_path = root / "Potsdam" / "2_Ortho_RGB" / f"top_potsdam_{tile_id}_RGB.tif"
+        image_path = root / "Potsdam" / ("3_Ortho_IRRG" if optical_product == "IRRG" else "2_Ortho_RGB") / f"top_potsdam_{tile_id}_{optical_product}.tif"
         ndsm_path = root / "Potsdam" / "1_DSM_normalisation" / f"dsm_potsdam_0{tile_id}_normalized_lastools.jpg"
-        label_name = f"top_potsdam_{tile_id}_label_noBoundary.tif"
+        label_name = f"top_potsdam_{tile_id}_label.tif"
     else:
         image_path = root / "Vaihingen" / "top" / f"top_mosaic_09cm_area{tile_id}.tif"
         ndsm_path = root / "Vaihingen" / "ndsm" / f"dsm_09cm_matching_area{tile_id}_normalized.jpg"
-        label_name = f"top_mosaic_09cm_area{tile_id}_noBoundary.tif"
-    label_path = root / "test" / dataset / label_name
+        label_name = f"top_mosaic_09cm_area{tile_id}.tif"
+    if dataset == 'Potsdam':
+        label_path = root / dataset / '5_Labels_all' / f'top_potsdam_{tile_id}_label.tif'
+    else:
+        label_path = root / dataset / 'gts_for_participants' / f'top_mosaic_09cm_area{tile_id}.tif'
     return image_path, ndsm_path, label_path, label_name
 
 
 def read_rgb(path: Path) -> np.ndarray:
     image = np.asarray(Image.open(path))
-    if image.ndim == 2:
-        image = np.repeat(image[..., None], 3, axis=2)
-    if image.shape[2] > 3:
-        image = image[:, :, :3]
+    if image.dtype != np.uint8 or image.shape[2] != 3:
+        raise ValueError(f'Expected uint8 three-channel optical image: {path}')
     return image.astype(np.float32) / 255.0
 
 
@@ -287,8 +301,10 @@ def read_label(path: Path) -> np.ndarray:
 
 
 def read_ndsm(path: Path) -> np.ndarray:
-    ndsm = np.asarray(Image.open(path).convert("L")).astype(np.float32) / 255.0
-    return ndsm
+    ndsm = np.asarray(Image.open(path))
+    if ndsm.dtype != np.uint8 or ndsm.ndim != 2:
+        raise ValueError(f'Expected normalized uint8 one-channel nDSM: {path}')
+    return ndsm.astype(np.float32) / 255.0
 
 
 def default_tile_ids(dataset: str) -> Sequence[str]:
@@ -306,13 +322,23 @@ def test_tiles(
         if args.output_dir
         else REPO_ROOT / "results" / config.dataset / model_tag(args.model)
     )
-    tile_ids = args.tile_ids or list(default_tile_ids(config.dataset))
+    with config.config_path.open() as stream:
+        split_ids = json.load(stream)['tile_ids'][config.split]
+    tile_ids = args.tile_ids or split_ids
+    if set(tile_ids) - set(split_ids):
+        raise ValueError(f'Tile IDs are outside the declared {config.split} split: {tile_ids}')
     confusion = np.zeros((config.num_classes, config.num_classes), dtype=np.int64)
     per_image = []
+    for tile_id in tile_ids:
+        paths = isprs_paths(config.dataset, tile_id, config.isprs_root, args.optical_product)
+        required = (paths[0], paths[2]) + ((paths[1],) if args.model == 'teacher' else ())
+        for path in required:
+            if not path.is_file():
+                raise FileNotFoundError(f'Missing {config.split} tile input/label: {path}')
 
     with torch.no_grad():
         for tile_id in tile_ids:
-            image_path, ndsm_path, label_path, label_name = isprs_paths(config.dataset, tile_id)
+            image_path, ndsm_path, label_path, label_name = isprs_paths(config.dataset, tile_id, config.isprs_root, args.optical_product)
             if not image_path.is_file():
                 raise FileNotFoundError(f"Missing ISPRS image: {image_path}")
             if args.model == "teacher" and not ndsm_path.is_file():
@@ -386,29 +412,49 @@ def test_tiles(
                 "fwiou": float(np.mean([item["fwiou"] for item in per_image])),
                 "f1": float(np.mean([item["f1"] for item in per_image])),
             }
-        if args.metric_mode in ("paper", "both") and paper_metrics is not None:
+        if args.metric_mode in ("legacy-per-tile", "both") and paper_metrics is not None:
             print(
-                "Paper eval | "
+                "Legacy per-tile mean (not manuscript protocol) | "
                 f"Acc:{paper_metrics['acc'] * 100:.3f} "
                 f"F1:{paper_metrics['f1'] * 100:.3f} "
                 f"mAcc:{paper_metrics['macc'] * 100:.3f} "
                 f"mIoU:{paper_metrics['miou'] * 100:.3f} "
                 f"FWIoU:{paper_metrics['fwiou'] * 100:.3f}"
             )
-        if args.metric_mode in ("global", "both"):
+        if args.metric_mode in ("paper", "global", "both"):
             print(f"Global eval | {metric_line(metrics)}")
         np.save(output_dir / "confusion.npy", confusion)
+        report = {
+            'dataset': config.dataset, 'split': config.split, 'model': args.model,
+            'checkpoint': args.checkpoint, 'architecture_version': config.architecture_version,
+            'optical_product': args.optical_product, 'window_size': args.window_size,
+            'stride': args.stride, 'batch_size': args.batch_size, 'tile_ids': list(tile_ids),
+            'partial': set(tile_ids) != set(split_ids), 'metric_protocol': 'global confusion',
+            'label_variant': 'full source labels',
+            'macc': float(metrics['macc']) * 100, 'miou': float(metrics['miou']) * 100,
+            'oa': float(metrics['oa']) * 100, 'kappa': float(metrics['kappa']) * 100,
+            'class_iou': np.asarray(metrics['iou']).tolist(),
+            'class_acc': np.asarray(metrics['acc']).tolist(), 'confusion': confusion.tolist(),
+        }
+        (output_dir / 'inference_metrics.json').write_text(json.dumps(report, indent=2))
 
 
 def main() -> None:
     args = parse_args()
     config = CESDNetConfig(dataset=args.dataset, num_workers=args.num_workers, seed=args.seed)
+    config = apply_runtime_args(config, args)
     if args.teacher_repo:
         config.teacher_repo = Path(args.teacher_repo)
     if args.teacher_backbone:
         config.teacher_backbone = Path(args.teacher_backbone)
-    seed_everything(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not args.checkpoint:
+        if args.model == "kd":
+            args.checkpoint = config.paper_kd_checkpoint
+        elif args.model in ("auto", "teacher"):
+            args.checkpoint = config.paper_teacher_checkpoint
+    require_checkpoint(args.checkpoint, "Provide --weights (or --checkpoint) with a complete compatible model checkpoint.")
+    seed_everything(config.seed, deterministic=getattr(config, "deterministic", False))
+    device = resolve_device(args)
     if args.model == "auto":
         args.model = infer_model_name(args.checkpoint, config)
         if args.model == "teacher" and not args.checkpoint:

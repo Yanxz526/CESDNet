@@ -19,18 +19,20 @@ def update_confusion(
     else:
         pred = logits_or_pred
 
+    if pred.shape != target.shape:
+        raise ValueError(f'Prediction/target shape mismatch: {pred.shape} vs {target.shape}')
     pred_np = pred.detach().cpu().numpy().astype(np.int64)
     target_np = target.detach().cpu().numpy().astype(np.int64)
     valid = (
         (target_np != ignore_index)
         & (target_np >= 0)
         & (target_np < num_classes)
-        & (pred_np >= 0)
-        & (pred_np < num_classes)
     )
     if ignore_labels:
         for label_id in ignore_labels:
             valid &= target_np != int(label_id)
+    if np.any(valid & ((pred_np < 0) | (pred_np >= num_classes))):
+        raise ValueError('Invalid prediction class on evaluated ground-truth pixels')
     if valid.sum() == 0:
         return confusion
 
@@ -101,9 +103,8 @@ def mean_f1(confusion: np.ndarray, eval_class_indices: Optional[Iterable[int]] =
     tp = np.diag(confusion)
     row_sum = confusion.sum(axis=1)
     col_sum = confusion.sum(axis=0)
-    precision = np.divide(tp, col_sum, out=np.full_like(tp, np.nan), where=col_sum > 0)
-    recall = np.divide(tp, row_sum, out=np.full_like(tp, np.nan), where=row_sum > 0)
-    f1 = 2.0 * precision * recall / (precision + recall)
+    denominator = row_sum + col_sum
+    f1 = np.divide(2 * tp, denominator, out=np.full_like(tp, np.nan), where=denominator > 0)
     if eval_class_indices is None:
         indices = [idx for idx in range(len(tp)) if not np.isnan(f1[idx])]
     else:

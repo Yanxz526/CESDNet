@@ -151,11 +151,12 @@ def compute_L_SCD(
     Q_sh_i = resize_like(student_stage["Q_sh"], K_sh_i)
     q_i = resize_like(student_stage["q"], r_sh_i)
 
+    # Equations (24)-(26): mean-reduced feature and response losses are
+    # separate. Concatenating responses changes their loss and weighting.
     M_res_i = resize_like(M_sh_i, r_sh_i)
-    Z_t_i = integrate_shared_knowledge(K_sh_i, torch.sigmoid(r_sh_i), eta_r=eta_r)
-    Z_s_i = integrate_shared_knowledge(Q_sh_i, torch.sigmoid(q_i), eta_r=eta_r)
-    M_z_i = torch.cat([M_sh_i.expand_as(K_sh_i), M_res_i], dim=1)
-    return F.smooth_l1_loss(M_z_i * Z_s_i, M_z_i * Z_t_i)
+    feature_loss = F.smooth_l1_loss(M_sh_i * Q_sh_i, M_sh_i * K_sh_i)
+    response_loss = F.mse_loss(M_res_i * torch.sigmoid(q_i), M_res_i * torch.sigmoid(r_sh_i))
+    return feature_loss + eta_r * response_loss
 
 
 def fourier_amplitude(F_i: torch.Tensor) -> torch.Tensor:
@@ -224,7 +225,7 @@ def compute_L_RCRD(
     H_t = -torch.sum(P_t_plain * torch.log(P_t_plain + eps), dim=1, keepdim=True) / math.log(k)
     M_cr = torch.exp(-lambda_rel * H_t).view(b, 1, n).detach()
 
-    denom = M_cr.sum(dim=2, keepdim=True).clamp_min(eps)
+    denom = M_cr.sum(dim=2, keepdim=True) + eps
     C_s = torch.bmm(P_s_tau * M_cr, P_s_tau.transpose(1, 2)) / denom
     C_t = torch.bmm(P_t_tau * M_cr, P_t_tau.transpose(1, 2)) / denom
     C_s = C_s / (C_s.sum(dim=2, keepdim=True) + eps)

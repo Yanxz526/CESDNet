@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 if __package__ is None or __package__ == "":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import torch
@@ -25,11 +25,14 @@ from CESDNet.models.teacher import (
     infer_teacher_texture_mode,
     infer_teacher_use_gmr_prior,
 )
-from CESDNet.utils.checkpoint import load_state_dict_flexible, save_checkpoint
+from CESDNet.utils.checkpoint import load_state_dict_flexible, save_checkpoint, checkpoint_sha256
 from CESDNet.utils.data import build_dataloaders, ensure_dir, seed_everything
 from CESDNet.utils.metrics import compute_metrics, metric_line, update_confusion
 from log import get_logger
-from toolbox.loss.loss import MscCrossEntropyLoss
+from CESDNet.utils.runtime import require_checkpoint, resolve_device
+from CESDNet.utils.runtime import (add_runtime_args, apply_runtime_args, limited_batches,
+    checked_loss, snapshot_runtime, restore_training, data_signature)
+from CESDNet.utils.runtime import SegmentationLoss as MscCrossEntropyLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-backbone", default="")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--amp", action="store_true")
+    add_runtime_args(parser, training=True)
     return parser.parse_args()
 
 
@@ -81,7 +85,7 @@ def evaluate_student(model, val_loader, criterion, config: CESDNetConfig, device
     val_loss = 0.0
     confusion = np.zeros((config.num_classes, config.num_classes), dtype=np.int64)
     with torch.no_grad():
-        for sample in val_loader:
+        for sample in limited_batches(val_loader, config.max_val_batches):
             x = sample["image"].to(device, non_blocking=True).float()
             y = sample["label"].to(device, non_blocking=True).long()
             O_s = model(x)
@@ -94,43 +98,28 @@ def evaluate_student(model, val_loader, criterion, config: CESDNetConfig, device
                 config.ignore_index,
                 ignore_labels=config.eval_ignore_labels,
             )
-    return val_loss / max(len(val_loader), 1), compute_metrics(confusion, config.eval_class_indices)
-
-
-def load_kd_resume(
-    student: torch.nn.Module,
-    kd_heads: torch.nn.Module,
-    optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.LRScheduler,
-    resume_path: str,
-) -> tuple[int, float]:
-    checkpoint = torch.load(resume_path, map_location="cpu")
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"Unsupported resume checkpoint: {resume_path}")
-    if "student_state_dict" in checkpoint:
-        student.load_state_dict(checkpoint["student_state_dict"], strict=False)
-    if "kd_heads_state_dict" in checkpoint:
-        kd_heads.load_state_dict(checkpoint["kd_heads_state_dict"], strict=False)
-    if "optimizer_state_dict" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if "scheduler_state_dict" in checkpoint:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    return int(checkpoint.get("epoch", 0)), float(checkpoint.get("best_miou", 0.0))
+    return val_loss / max(min(len(val_loader), config.max_val_batches or len(val_loader)), 1), compute_metrics(confusion, config.eval_class_indices)
 
 
 def main() -> None:
     args = parse_args()
-    config = make_config(args)
+    config = apply_runtime_args(make_config(args), args)
     teacher_checkpoint = args.teacher_checkpoint or config.paper_teacher_checkpoint
-    if not teacher_checkpoint:
-        raise ValueError("Pass --teacher-checkpoint or fill PAPER_TEACHER_CHECKPOINTS in CESDNet/config.py.")
-    if not Path(teacher_checkpoint).is_file():
-        raise FileNotFoundError(f"CESDNet-KD teacher checkpoint not found: {teacher_checkpoint}")
-    seed_everything(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    require_checkpoint(teacher_checkpoint, "Provide --teacher-checkpoint with a complete CESDNet-T checkpoint.")
+    if args.resume:
+        require_checkpoint(args.resume, "Provide --resume with a complete KD training checkpoint.")
+    if args.student_checkpoint:
+        require_checkpoint(args.student_checkpoint, "Provide --student-checkpoint with compatible student weights.")
+    elif not args.resume and not args.no_pretrained:
+        require_checkpoint(config.dformer_weight,
+                           "Provide --student-checkpoint or --dformer-weight, or use --no-pretrained to initialize the student from scratch.")
+    config.amp = args.amp
+    seed_everything(config.seed, deterministic=getattr(config, "deterministic", False))
+    device = resolve_device(args)
 
     train_loader, val_loader = build_dataloaders(config, batch_size=config.kd_batch_size)
 
+    teacher_sha256 = checkpoint_sha256(teacher_checkpoint)
     use_gmr_prior = infer_teacher_use_gmr_prior(teacher_checkpoint)
     texture_mode = infer_teacher_texture_mode(teacher_checkpoint)
     head_profile = infer_teacher_head_profile(teacher_checkpoint)
@@ -139,27 +128,19 @@ def main() -> None:
         use_gmr_prior=use_gmr_prior,
         texture_mode=texture_mode,
         head_profile=head_profile,
+        checkpoint_path=teacher_checkpoint,
     ).to(device)
-    msg = load_state_dict_flexible(
-        teacher,
-        teacher_checkpoint,
-        preferred_keys=("teacher_state_dict", "state_dict", "model", "net"),
-        strict=False,
-    )
-    print(
-        f"Loaded CESDNet-T: missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}"
-    )
     teacher.eval()
     for param in teacher.parameters():
         param.requires_grad = False
 
-    student = build_cesdnet_s(config, use_pretrained=not args.no_pretrained).to(device)
+    student = build_cesdnet_s(config, use_pretrained=not args.no_pretrained and not bool(args.student_checkpoint or args.resume)).to(device)
     if args.student_checkpoint:
         msg = load_state_dict_flexible(
             student,
             args.student_checkpoint,
             preferred_keys=("student_state_dict", "state_dict", "model", "net"),
-            strict=False,
+            strict=True,
         )
         print(f"Loaded CESDNet-S init: missing={len(msg.missing_keys)} unexpected={len(msg.unexpected_keys)}")
 
@@ -181,7 +162,12 @@ def main() -> None:
     start_epoch = 0
     best_miou = 0.0
     if args.resume:
-        start_epoch, best_miou = load_kd_resume(student, kd_heads, optimizer, scheduler, args.resume)
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if checkpoint.get("teacher_sha256") != teacher_sha256:
+            raise ValueError("KD resume teacher checkpoint SHA256 mismatch")
+        student.load_state_dict(checkpoint["student_state_dict"], strict=True)
+        kd_heads.load_state_dict(checkpoint["kd_heads_state_dict"], strict=True)
+        start_epoch, best_miou = restore_training(args.resume, optimizer, scheduler, scaler, train_loader, config)
         print(f"Resume CESDNet-KD from epoch {start_epoch}, best_mIoU={best_miou:.3f}")
 
     output_dir = (
@@ -223,7 +209,7 @@ def main() -> None:
         teacher.eval()
         sums = {"total": 0.0, "seg": 0.0, "L_SCD": 0.0, "L_CPD": 0.0, "L_RCRD": 0.0, "L_CESD_KD": 0.0}
 
-        for step, sample in enumerate(train_loader, start=1):
+        for step, sample in enumerate(limited_batches(train_loader, config.max_train_batches), start=1):
             x = sample["image"].to(device, non_blocking=True).float()
             z = sample["dsm"].to(device, non_blocking=True).float()
             y = sample["label"].to(device, non_blocking=True).long()
@@ -241,7 +227,7 @@ def main() -> None:
                 terms = criterion_kd(O_s, O_t, student_kd, kd_t, L_seg=L_seg, epoch=epoch)
                 L_total = terms.L_total if terms.L_total is not None else L_seg + terms.L_CESD_KD
 
-            scaler.scale(L_total).backward()
+            scaler.scale(checked_loss(L_total)).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(list(trainable_parameters(student, kd_heads)), max_norm=2.0)
             scaler.step(optimizer)
@@ -266,7 +252,7 @@ def main() -> None:
 
         scheduler.step()
         val_loss, metrics = evaluate_student(student, val_loader, criterion_seg, config, device)
-        n = max(len(train_loader), 1)
+        n = max(min(len(train_loader), config.max_train_batches or len(train_loader)), 1)
         avg_total = sums["total"] / n
         avg_seg = sums["seg"] / n
         avg_scd = sums["L_SCD"] / n
@@ -316,8 +302,13 @@ def main() -> None:
                 "acc": np.asarray(metrics["acc"]).tolist(),
             },
             "config": vars(config),
+            **snapshot_runtime(scaler, train_loader),
+            "data_signature": data_signature(config),
             "teacher_checkpoint": teacher_checkpoint,
+            "teacher_sha256": teacher_sha256,
         }
+        miou_pct = float(metrics["miou"]) * 100
+        payload["best_miou"] = max(best_miou, miou_pct)
         save_checkpoint(output_dir / "CESDNet-KD-last.pth", payload)
         miou_pct = float(metrics["miou"]) * 100
         if miou_pct >= best_miou:
@@ -325,6 +316,10 @@ def main() -> None:
             payload["best_miou"] = best_miou
             save_checkpoint(output_dir / f"CESDNet-KD-{config.dataset}-best.pth", payload)
             print(f"Saved best CESDNet-KD mIoU={best_miou:.3f}")
+
+        if config.stop_after_epoch and epoch + 1 >= config.stop_after_epoch:
+            print(f'Diagnostic stop after epoch {epoch + 1}; checkpoint saved.')
+            break
 
 
 if __name__ == "__main__":

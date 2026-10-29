@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import contextlib
-import io
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -15,7 +14,7 @@ from toolbox.backbone.DFormer1.DFormer import DFormer_Tiny
 
 def _unwrap_checkpoint_state(checkpoint: Any) -> Mapping[str, torch.Tensor]:
     if not isinstance(checkpoint, Mapping):
-        return checkpoint
+        raise TypeError("Student checkpoint must contain a tensor state dictionary")
     for key in ("student_state_dict", "state_dict", "model", "net", "module"):
         value = checkpoint.get(key)
         if isinstance(value, Mapping):
@@ -28,34 +27,69 @@ def infer_student_architecture(checkpoint_path: str | Path | None, default: str 
         return default
     path = Path(checkpoint_path)
     if not path.is_file():
-        return default
-    checkpoint = torch.load(str(path), map_location="cpu")
+        raise FileNotFoundError(f"Student checkpoint not found: {path}")
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
     state_dict = _unwrap_checkpoint_state(checkpoint)
-    if not isinstance(state_dict, Mapping):
-        return default
+    state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
     if any(key.startswith("hfip3.") or key.startswith("hfip4.") for key in state_dict):
         return "hfip"
     if any(key.startswith("cafe3.") or key.startswith("cafe4.") for key in state_dict):
         return "cafe"
-    return default
+    if any(key.startswith("enhance_c3.") or key.startswith("enhance_c4.") for key in state_dict):
+        return "paper"
+    raise ValueError(f"Unrecognized CESDNet student architecture in {path}")
 
 
-def load_dformer_weight(backbone: nn.Module, path: Optional[str | Path]) -> None:
-    if path is None or not Path(path).is_file():
-        return
-    checkpoint = torch.load(str(path), map_location="cpu")
+def load_dformer_weight(backbone: nn.Module, path: Optional[str | Path]) -> Dict[str, Any]:
+    if not path:
+        raise ValueError("DFormer pretrained initialization requires an explicit weight file")
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"DFormer pretrained weights not found: {path}")
+    checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
     if isinstance(checkpoint, Mapping):
         state_dict = checkpoint.get("state_dict_ema", checkpoint.get("state_dict", checkpoint))
     else:
         state_dict = checkpoint
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError(f"DFormer checkpoint contains no state dictionary: {path}")
     stripped = {}
     for key, value in state_dict.items():
-        if key.startswith("module."):
-            key = key[len("module.") :]
-        if key.startswith("backbone."):
-            key = key[len("backbone.") :]
+        while key.startswith(("module.", "backbone.")):
+            key = key.split(".", 1)[1]
+        if key in stripped:
+            raise ValueError(f"Duplicate DFormer parameter after prefix normalization: {key}")
         stripped[key] = value
-    backbone.load_state_dict(stripped, strict=False)
+    expected = backbone.state_dict()
+    missing = sorted(set(expected) - set(stripped))
+    mismatched = [key for key in expected if key in stripped and
+                  (not isinstance(stripped[key], torch.Tensor) or
+                   expected[key].shape != stripped[key].shape)]
+    # The upstream ImageNet checkpoint includes a classification head and
+    # auxiliary-stream tensors unused by the last (optical-output-only) block.
+    unused_prefixes = (
+        "pred.", "stages.3.1.attn.proj_e.", "stages.3.1.mlp_e2.",
+    )
+    unused_names = {"stages.3.1.layer_scale_1_e", "stages.3.1.layer_scale_2_e"}
+    unexpected = sorted(key for key in set(stripped) - set(expected)
+                        if key not in unused_names and not key.startswith(unused_prefixes))
+    if missing or mismatched or unexpected:
+        raise RuntimeError(
+            f"DFormer-Tiny checkpoint mismatch: missing={missing[:8]}, "
+            f"shape_mismatch={mismatched[:8]}, unexpected={unexpected[:8]}"
+        )
+    backbone.load_state_dict({key: stripped[key] for key in expected}, strict=True)
+    digest = hashlib.sha256()
+    with path.open("rb") as fp:
+        for block in iter(lambda: fp.read(1024 * 1024), b""):
+            digest.update(block)
+    report = {
+        "pretrained": True, "path": str(path.resolve()), "sha256": digest.hexdigest(),
+        "loaded_tensors": len(expected),
+        "ignored_source_keys": sorted(set(stripped) - set(expected)),
+    }
+    print(f"Loaded DFormer-Tiny: {len(expected)}/{len(expected)} tensors; sha256={report['sha256']}")
+    return report
 
 
 class StudentFeatureEnhancer(nn.Module):
@@ -280,10 +314,10 @@ class CESDNetS(nn.Module):
         self.num_classes = num_classes
         self.student_arch = student_arch
         self.stage_channels = {"c1": 32, "c2": 64, "c3": 128, "c4": 256}
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.backbone = DFormer_Tiny(pretrained=False)
-        if use_pretrained and dformer_weight is not None:
-            load_dformer_weight(self.backbone, dformer_weight)
+        self.backbone = DFormer_Tiny(pretrained=False)
+        self.initialization_report = {"pretrained": False}
+        if use_pretrained:
+            self.initialization_report = load_dformer_weight(self.backbone, dformer_weight)
         channels = list(self.stage_channels.values())
         if student_arch == "paper":
             self.enhance_c3 = StudentFeatureEnhancer(self.stage_channels["c3"])
@@ -306,6 +340,8 @@ class CESDNetS(nn.Module):
         return_features: bool = False,
         return_feats: bool = False,
     ):
+        if x.ndim != 4 or x.shape[1] != 3:
+            raise ValueError(f"CESDNet-S requires Bx3xHxW optical input, got {tuple(x.shape)}")
         target_size = x.shape[-2:]
         c1, c2, c3, c4 = self.backbone(x, x_e=None)
         if self.student_arch == "paper":
@@ -336,11 +372,11 @@ CESDNetKD = CESDNetS
 def build_cesdnet_s(
     config: CESDNetConfig,
     use_pretrained: bool = True,
-    student_arch: str = "paper",
+    student_arch: Optional[str] = None,
 ) -> CESDNetS:
     return CESDNetS(
         num_classes=config.num_classes,
         dformer_weight=config.dformer_weight,
         use_pretrained=use_pretrained,
-        student_arch=student_arch,
+        student_arch=student_arch or config.student_arch,
     )

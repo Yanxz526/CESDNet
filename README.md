@@ -381,5 +381,3 @@ The paper link and BibTeX will be updated upon publication.
 ## Acknowledgement
 
 This project builds on [DINOv3](https://github.com/facebookresearch/dinov3) and [DFormer](https://github.com/VCIP-RGBD/DFormer).
-
-Updated some content.

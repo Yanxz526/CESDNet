@@ -1,35 +1,48 @@
-# Python
+# Python and compiled extensions
 __pycache__/
 *.py[cod]
 *.so
+*.egg-info/
+build/
+dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
-# Virtual environments
+# Environments, editor state and local tools
 .venv/
 venv/
 env/
-
-# IDE and operating system files
 .idea/
 .vscode/
+.codex/
+.agents/
+.claude/
+.omx/
+.learnings/
 .DS_Store
 Thumbs.db
 
-# Local agent metadata
-.learnings/
-
-# Datasets, checkpoints, and generated outputs
+# Local data, weights and runtime outputs
+data/
 database/
 ISPRS/
 checkpoints/
-results/
+weight/
+weights/
 outputs/
+results/
+reports/
 logs/
+runs/
+wandb/
+eval_records/
+private/
 *.pth
 *.pt
 *.ckpt
+*.log
+events.out.tfevents.*
 
 # Local secrets
 .env
