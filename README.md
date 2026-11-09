@@ -1,30 +1,7 @@
 <div align="center">
 
-<h1>Disentangle-Then-Distill: Complementary Expert-Guided Structured Distillation<br>for Remote Sensing Semantic Segmentation</h1>
 
-<p>
-  <img src="https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white" alt="Python 3.10"/>
-  <img src="https://img.shields.io/badge/PyTorch-2.6.0-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch 2.6.0"/>
-  <img src="https://img.shields.io/badge/Task-Semantic%20Segmentation-4C8BF5" alt="Semantic Segmentation"/>
-</p>
 
-<p>
-  <a href="#highlights">Highlights</a> |
-  <a href="#architecture">Architecture</a> |
-  <a href="#installation">Installation</a> |
-  <a href="#training">Training</a> |
-  <a href="#results">Results</a>
-</p>
-
-</div>
-
----
-
-## Highlights
-
-- **Disentangle then distill.** GeoMoE uses TPE and AGE to organize complementary texture-oriented and geometry-oriented knowledge before distillation.
-- **Structured knowledge transfer.** SCD, CPD, and RCRD transfer shared semantics, expert-specific knowledge, and reliable class relations.
-- **Efficient optical-only inference.** CESDNet-KD requires no nDSM at inference and achieves 82.32% / 77.03% mIoU on Vaihingen / Potsdam with 5.39 M trainable parameters.
 
 ## Architecture
 
@@ -34,6 +11,7 @@
   <img src="./images/CESDNet.jpg" alt="Overall architecture of CESDNet" width="96%"/>
 </p>
 
+
 <p align="center"><sub><strong>Figure 1.</strong> Overall framework of CESDNet.</sub></p>
 
 ### Multimodal Teacher: CESDNet-T
@@ -41,6 +19,7 @@
 <p align="center">
   <img src="./images/CESDNet-T.jpg" alt="Architecture of CESDNet-T" width="96%"/>
 </p>
+
 
 <p align="center"><sub><strong>Figure 2.</strong> Architecture of the dual-expert multimodal teacher CESDNet-T.</sub></p>
 
@@ -118,13 +97,13 @@ checkpoints/
 Missing or empty required weight files print an actionable message and stop
 before loading data. Incompatible checkpoints are rejected during loading.
 
-| Entry point | Required weight argument |
-|---|---|
+| Entry point        | Required weight argument                                     |
+| ------------------ | ------------------------------------------------------------ |
 | `train_teacher.py` | `--teacher-backbone`, or `--resume` for a complete training checkpoint |
 | `train_student.py` | `--dformer-weight`, `--no-pretrained` for scratch training, or `--resume` for continuation |
-| `train_kd.py` | `--teacher-checkpoint`; initialize the student with `--student-checkpoint`, `--dformer-weight` or `--no-pretrained` |
-| `test.py` | `--weights` / `--checkpoint` |
-| `eval.py` | `--pred-dir` for saved predictions; no weights are required in this mode |
+| `train_kd.py`      | `--teacher-checkpoint`; initialize the student with `--student-checkpoint`, `--dformer-weight` or `--no-pretrained` |
+| `test.py`          | `--weights` / `--checkpoint`                                 |
+| `eval.py`          | `--pred-dir` for saved predictions; no weights are required in this mode |
 
 ## Data Preparation
 
@@ -189,7 +168,7 @@ inference. Training requires both `train.txt` and a separate `val.txt`.
 
 ## Training
 
-Paper settings:
+Default settings:
 
 - Optimizer: AdamW
 - Epochs: `100`
@@ -314,70 +293,8 @@ Patch testing additionally requires `test.txt` from data preparation.
 For an explicit tile subset, pass the same `--tile-ids` to both `test.py` and
 `eval.py`; the result is marked as partial.
 
-Historical unversioned teacher checkpoints require `--architecture-version legacy_v0`.
-The legacy Potsdam teacher additionally requires the optional extension described
-in `toolbox/models/shift_wiseConv_master/BUILD.md`. Third-party licenses are retained
-alongside their sources.
-
-## Results
-
-The following values are reported in the paper for `256 x 256` inputs. **Trainable Params** excludes the frozen DINOv3 backbone. Short execution checks validate the code path; they do not reproduce the accuracy values in this table.
-
-<table>
-  <thead>
-    <tr>
-      <th align="center" rowspan="2"><small>Model</small></th>
-      <th align="center" rowspan="2"><small>Input</small></th>
-      <th align="center" rowspan="2"><small>Trainable<br>Params (M)</small></th>
-      <th align="center" rowspan="2"><small>FLOPs (G)</small></th>
-      <th align="center" colspan="2"><small>Vaihingen</small></th>
-      <th align="center" colspan="2"><small>Potsdam</small></th>
-    </tr>
-    <tr>
-      <th align="center"><small>mAcc (%)</small></th>
-      <th align="center"><small>mIoU (%)</small></th>
-      <th align="center"><small>mAcc (%)</small></th>
-      <th align="center"><small>mIoU (%)</small></th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td align="center"><small>CESDNet&#8209;T</small></td>
-      <td align="center"><small>Optical + nDSM</small></td>
-      <td align="center"><small>100.04</small></td>
-      <td align="center"><small>76.54</small></td>
-      <td align="center"><small><strong>90.63</strong></small></td>
-      <td align="center"><small><strong>83.71</strong></small></td>
-      <td align="center"><small><strong>87.22</strong></small></td>
-      <td align="center"><small><strong>78.95</strong></small></td>
-    </tr>
-    <tr>
-      <td align="center"><small>CESDNet&#8209;S</small></td>
-      <td align="center"><small>Optical only</small></td>
-      <td align="center"><small><strong>5.39</strong></small></td>
-      <td align="center"><small><strong>2.10</strong></small></td>
-      <td align="center"><small>86.10</small></td>
-      <td align="center"><small>77.47</small></td>
-      <td align="center"><small>83.47</small></td>
-      <td align="center"><small>73.97</small></td>
-    </tr>
-    <tr>
-      <td align="center"><small><strong>CESDNet&#8209;KD</strong></small></td>
-      <td align="center"><small><strong>Optical only</strong></small></td>
-      <td align="center"><small><strong>5.39</strong></small></td>
-      <td align="center"><small><strong>2.10</strong></small></td>
-      <td align="center"><small>89.86</small></td>
-      <td align="center"><small>82.32</small></td>
-      <td align="center"><small>85.54</small></td>
-      <td align="center"><small>77.03</small></td>
-    </tr>
-  </tbody>
-</table>
-
-## Citation
-
-The paper link and BibTeX will be updated upon publication.
-
 ## Acknowledgement
 
-This project builds on [DINOv3](https://github.com/facebookresearch/dinov3) and [DFormer](https://github.com/VCIP-RGBD/DFormer).
+This repository builds on [DINOv3](https://github.com/facebookresearch/dinov3) and [DFormer](https://github.com/VCIP-RGBD/DFormer).
+Their licenses are retained in the corresponding source directories.
+
